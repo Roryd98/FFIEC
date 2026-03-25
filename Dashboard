@@ -139,8 +139,8 @@
   </div>
 
   <div class="controls">
-    <input type="file" id="pdfInput" multiple accept=".pdf" />
-    <button onclick="processPDFs()">Process PDFs</button>
+    <input type="file" id="pdfInput" multiple accept=".pdf,.html,.htm" />
+    <button onclick="processFiles()">Process Files</button>
   </div>
 
   <div id="status" class="status"></div>
@@ -253,7 +253,7 @@ const chartData = [];      // { bank, totalPct }
 const loansOnlyData = [];  // { bank, loansPct }
 
 /* ---------- main ---------- */
-async function processPDFs() {
+async function processFiles() {
   const files = document.getElementById('pdfInput').files;
   const tbody = document.getElementById('tableBody');
   const status = document.getElementById('status');
@@ -264,7 +264,13 @@ async function processPDFs() {
 
   for (const file of files) {
     status.textContent = `Processing ${file.name}…`;
-    await processSinglePDF(file, tbody);
+    const dotIdx = file.name.lastIndexOf('.');
+    const ext = dotIdx !== -1 ? file.name.slice(dotIdx + 1).toLowerCase() : '';
+    if (ext === 'html' || ext === 'htm') {
+      await processSingleHTML(file, tbody);
+    } else {
+      await processSinglePDF(file, tbody);
+    }
   }
 
   renderCharts();
@@ -292,6 +298,87 @@ async function processSinglePDF(file, tbody) {
   // Derived percentages
   let totalPct = null; // (RCFDPV13 + RCFDPV06) / RCFA8274
   let loansPct = null; // RCFDPV06 / RCFA8274
+
+  if (res.RCFA8274 && res.RCFA8274 !== 0) {
+    if (res.RCFDPV13 !== null && res.RCFDPV06 !== null) {
+      totalPct = ((res.RCFDPV13 + res.RCFDPV06) / res.RCFA8274) * 100;
+    }
+    if (res.RCFDPV06 !== null) {
+      loansPct = (res.RCFDPV06 / res.RCFA8274) * 100;
+    }
+  }
+
+  const bank = shortBankName(res.institution);
+
+  tbody.insertAdjacentHTML('beforeend', `
+    <tr>
+      <td>${bank}</td>
+      <td>Loans to business credit intermediaries</td>
+      <td class="number">${res.RCFDPV13?.toLocaleString() ?? 'N/A'}</td>
+      <td class="number">${res.RCFDPV06?.toLocaleString() ?? 'N/A'}</td>
+      <td class="number">${res.RCFA8274?.toLocaleString() ?? 'N/A'}</td>
+      <td class="percent">${Number.isFinite(totalPct) ? totalPct.toFixed(2)+'%' : 'N/A'}</td>
+    </tr>
+  `);
+
+  if (Number.isFinite(totalPct)) chartData.push({ bank, value: totalPct });
+  if (Number.isFinite(loansPct)) loansOnlyData.push({ bank, value: loansPct });
+}
+
+async function processSingleHTML(file, tbody) {
+  const html = await file.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  const res = { institution: '', RCFDPV13: null, RCFDPV06: null, RCFA8274: null };
+
+  // Extract institution name from common FFIEC HTML patterns:
+  // 1. A cell/element that follows "Institution Name" text
+  // 2. <title> tag containing the institution name
+  const allText = doc.body ? doc.body.innerText || doc.body.textContent : '';
+  const instMatch = allText.match(/Institution\s+Name[:\s]+([^\n<>]+)/i);
+  if (instMatch) {
+    res.institution = instMatch[1].trim();
+  } else {
+    const titleEl = doc.querySelector('title');
+    res.institution = titleEl ? titleEl.textContent.trim() : file.name.replace(/\.html?$/i, '');
+  }
+
+  // Walk every table row looking for MDRM code cells followed by a value cell.
+  // FFIEC HTML tables typically have rows like:
+  //   <td>RCFDPV13</td> ... <td>12345</td>
+  const TARGET_CODES = new Set(['RCFDPV13', 'RCFDPV06', 'RCFA8274']);
+
+  doc.querySelectorAll('tr').forEach(row => {
+    const cells = Array.from(row.querySelectorAll('td, th'));
+    cells.forEach((cell, idx) => {
+      const code = cell.textContent.trim().toUpperCase();
+      if (TARGET_CODES.has(code) && res[code] === null) {
+        // The value is usually in the next non-empty cell in the same row
+        for (let j = idx + 1; j < cells.length; j++) {
+          const val = parseNumber(cells[j].textContent.trim());
+          if (val !== null) {
+            res[code] = val;
+            break;
+          }
+        }
+      }
+    });
+  });
+
+  // Fallback: scan raw text for patterns like "RCFDPV13  12,345"
+  if (res.RCFDPV13 === null || res.RCFDPV06 === null || res.RCFA8274 === null) {
+    for (const code of TARGET_CODES) {
+      if (res[code] !== null) continue;
+      const re = new RegExp(code + '[\\s\\t]+([\\d,()\\-]+)', 'i');
+      const m = allText.match(re);
+      if (m) res[code] = parseNumber(m[1]);
+    }
+  }
+
+  // Derived percentages
+  let totalPct = null;
+  let loansPct = null;
 
   if (res.RCFA8274 && res.RCFA8274 !== 0) {
     if (res.RCFDPV13 !== null && res.RCFDPV06 !== null) {
